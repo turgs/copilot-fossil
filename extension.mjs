@@ -8,6 +8,7 @@ import { execSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   watch,
@@ -161,17 +162,24 @@ function updateGitHead(cwd, branch) {
   } catch {}
   writeFileSync(headPath, desired);
 
-  // Ensure the branch ref file exists so `git branch --show-current` resolves it
+  // Ensure the branch ref file exists — reuse any existing ref's SHA
   const refPath = `${cwd}/.git/refs/heads/${branch}·fossil`;
   if (!existsSync(refPath)) {
     try {
-      const head = execSync("git rev-parse HEAD", {
-        cwd,
-        encoding: "utf8",
-        timeout: 2000,
-        stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
-      writeFileSync(refPath, head + "\n");
+      // Find any existing ref SHA to reuse (avoids git rev-parse on empty ref)
+      const refsDir = `${cwd}/.git/refs/heads`;
+      const existing = readdirSync(refsDir).find(
+        (f) => f !== `${branch}·fossil`
+      );
+      const sha = existing
+        ? readFileSync(`${refsDir}/${existing}`, "utf8").trim()
+        : execSync("git rev-parse HEAD", {
+            cwd,
+            encoding: "utf8",
+            timeout: 2000,
+            stdio: ["pipe", "pipe", "pipe"],
+          }).trim();
+      writeFileSync(refPath, sha + "\n");
     } catch {}
   }
   return true;
@@ -218,18 +226,29 @@ if (!branch) process.exit(0);
 
 createGitSpoof(cwd, branch);
 
-// Watch .fslckout for branch switches between turns
-let watcher;
+// Watch .fslckout + WAL for branch switches between turns.
+// fs.watch on SQLite misses WAL-only writes, so we also poll as fallback.
+const watchers = [];
 try {
-  const target = existsSync(`${cwd}/.fslckout`)
-    ? `${cwd}/.fslckout`
-    : `${cwd}/_FOSSIL_`;
-  watcher = watch(target, () => {
-    const b = getFossilBranch(cwd);
-    if (b) updateGitHead(cwd, b);
-  });
-  watcher.unref();
+  const base = existsSync(`${cwd}/.fslckout`) ? ".fslckout" : "_FOSSIL_";
+  for (const suffix of ["", "-wal"]) {
+    const target = `${cwd}/${base}${suffix}`;
+    if (!existsSync(target) && suffix) continue;
+    const w = watch(target, () => {
+      const b = getFossilBranch(cwd);
+      if (b) updateGitHead(cwd, b);
+    });
+    w.unref();
+    watchers.push(w);
+  }
 } catch {}
+
+// Poll every 5s as a safety net — fs.watch is unreliable on Linux/SQLite
+const poller = setInterval(() => {
+  const b = getFossilBranch(cwd);
+  if (b) updateGitHead(cwd, b);
+}, 5000);
+poller.unref();
 
 function refreshState() {
   const b = getFossilBranch(cwd);
@@ -292,7 +311,8 @@ const session = await joinSession({
       }
     },
     onSessionEnd: async () => {
-      if (watcher) watcher.close();
+      clearInterval(poller);
+      for (const w of watchers) w.close();
       removeGitSpoof(cwd);
     },
   },
