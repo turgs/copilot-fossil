@@ -1,7 +1,13 @@
 // Fossil VCS extension for GitHub Copilot CLI
-// Self-contained: no .bashrc wrapper, no persistent files.
-// Creates a temporary .git/ spoof so the TUI shows the fossil branch,
-// keeps it fresh via hooks and fs.watch, cleans up on session end.
+// Creates a .git/ spoof so the TUI shows the fossil branch,
+// keeps it fresh via hooks and fs.watch.
+//
+// Resilience strategy:
+// - .git/ spoof persists across sessions (not deleted on end)
+// - createGitSpoof() refreshes it idempotently on each load
+// - Global error handlers prevent silent process death
+// - If the CLI doesn't re-fork us, the stale spoof still shows
+//   the last-known branch (better than blank)
 
 import { joinSession } from "@github/copilot-sdk/extension";
 import { execSync } from "node:child_process";
@@ -10,10 +16,20 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  rmSync,
   watch,
   writeFileSync,
 } from "node:fs";
+
+// --- Crash protection ---
+// Unhandled errors in hooks kill the child process silently.
+// Catch them so the extension survives transient failures.
+
+process.on("uncaughtException", (err) => {
+  try { process.stderr.write(`[fossil-vcs] uncaught: ${err}\n`); } catch {}
+});
+process.on("unhandledRejection", (err) => {
+  try { process.stderr.write(`[fossil-vcs] unhandled rejection: ${err}\n`); } catch {}
+});
 
 const MARKER = "Spoofed by copilotcli-fossil";
 
@@ -185,11 +201,6 @@ function updateGitHead(cwd, branch) {
   return true;
 }
 
-function removeGitSpoof(cwd) {
-  if (!isSpoofedGit(cwd)) return;
-  rmSync(`${cwd}/.git`, { recursive: true, force: true });
-}
-
 // --- Main ---
 
 const cwd = process.cwd();
@@ -226,29 +237,18 @@ if (!branch) process.exit(0);
 
 createGitSpoof(cwd, branch);
 
-// Watch .fslckout + WAL for branch switches between turns.
-// fs.watch on SQLite misses WAL-only writes, so we also poll as fallback.
-const watchers = [];
+// Watch .fslckout for branch switches between turns
+let watcher;
 try {
-  const base = existsSync(`${cwd}/.fslckout`) ? ".fslckout" : "_FOSSIL_";
-  for (const suffix of ["", "-wal"]) {
-    const target = `${cwd}/${base}${suffix}`;
-    if (!existsSync(target) && suffix) continue;
-    const w = watch(target, () => {
-      const b = getFossilBranch(cwd);
-      if (b) updateGitHead(cwd, b);
-    });
-    w.unref();
-    watchers.push(w);
-  }
+  const target = existsSync(`${cwd}/.fslckout`)
+    ? `${cwd}/.fslckout`
+    : `${cwd}/_FOSSIL_`;
+  watcher = watch(target, () => {
+    const b = getFossilBranch(cwd);
+    if (b) updateGitHead(cwd, b);
+  });
+  watcher.unref();
 } catch {}
-
-// Poll every 5s as a safety net — fs.watch is unreliable on Linux/SQLite
-const poller = setInterval(() => {
-  const b = getFossilBranch(cwd);
-  if (b) updateGitHead(cwd, b);
-}, 5000);
-poller.unref();
 
 function refreshState() {
   const b = getFossilBranch(cwd);
@@ -311,9 +311,11 @@ const session = await joinSession({
       }
     },
     onSessionEnd: async () => {
-      clearInterval(poller);
-      for (const w of watchers) w.close();
-      removeGitSpoof(cwd);
+      if (watcher) watcher.close();
+      // Don't delete .git/ — leave it with the current branch so the
+      // TUI still shows something even if the CLI doesn't re-fork us.
+      // The next extension load's createGitSpoof() will refresh it.
+      refreshState();
     },
   },
 });
